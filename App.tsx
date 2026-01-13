@@ -12,20 +12,26 @@ import {
   Search,
   AlertCircle,
   Image as ImageIcon,
-  Maximize2
+  Maximize2,
+  Trash2,
+  Plus
 } from 'lucide-react';
 import { TextbookData, Message } from './types';
 import { processPdf } from './utils/pdf';
 import { askGemini } from './services/gemini';
 
 const App: React.FC = () => {
-  const [textbook, setTextbook] = useState<TextbookData | null>(null);
+  const [textbooks, setTextbooks] = useState<TextbookData[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isAnswering, setIsAnswering] = useState(false);
+  
+  // State for the previewer
+  const [selectedBookIdx, setSelectedBookIdx] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const [viewMode, setViewMode] = useState<'chat' | 'split'>('split');
+  
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -34,31 +40,53 @@ const App: React.FC = () => {
   }, [messages]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
     setIsProcessing(true);
     try {
-      const pages = await processPdf(file);
-      setTextbook({ name: file.name, pages });
-      setCurrentPage(1); 
-      setMessages([{
-        id: 'welcome',
+      const newBooks: TextbookData[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const pages = await processPdf(files[i]);
+        newBooks.push({ name: files[i].name, pages });
+      }
+      
+      const updatedTextbooks = [...textbooks, ...newBooks];
+      setTextbooks(updatedTextbooks);
+      
+      // If it's the first book(s), set the first one as active
+      if (textbooks.length === 0) {
+        setSelectedBookIdx(0);
+        setCurrentPage(1);
+      }
+
+      setMessages(prev => [...prev, {
+        id: `upload-${Date.now()}`,
         role: 'assistant',
-        content: `I've successfully loaded "${file.name}". I am now configured for "Global Deep Search" across all provided chapters. I will synthesize information from both introductory and advanced sections, including relevant figures.`,
+        content: `I've added ${newBooks.length} new book(s) to the library. You now have ${updatedTextbooks.length} books indexed for search. I will synthesize answers using all available material.`,
         timestamp: Date.now()
       }]);
     } catch (err) {
       console.error(err);
-      alert("Failed to process PDF. Ensure it's a valid file.");
+      alert("Failed to process one or more PDFs. Ensure they are valid files.");
     } finally {
       setIsProcessing(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const removeBook = (idx: number) => {
+    const newBooks = textbooks.filter((_, i) => i !== idx);
+    setTextbooks(newBooks);
+    if (selectedBookIdx >= newBooks.length) {
+      setSelectedBookIdx(Math.max(0, newBooks.length - 1));
+      setCurrentPage(1);
     }
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || !textbook || isAnswering) return;
+    if (!input.trim() || textbooks.length === 0 || isAnswering) return;
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -71,47 +99,75 @@ const App: React.FC = () => {
     setInput('');
     setIsAnswering(true);
 
-    const answer = await askGemini(input, textbook.pages, messages.map(m => ({ role: m.role, content: m.content })));
+    const answer = await askGemini(input, textbooks, messages.map(m => ({ role: m.role, content: m.content })));
     
-    // Extract ALL page numbers mentioned in text
-    const pageMatches = [...answer.matchAll(/Page (\d+)/gi)];
-    // Extract VISUAL_REFERENCES
-    const visualMatches = answer.match(/VISUAL_REFERENCES: \[(.*?)\]/i);
-    const visualPages = visualMatches 
-      ? visualMatches[1].split(',').map(s => parseInt(s.replace(/\D/g, ''))) 
-      : [];
+    // Parse references: (Book: [Name], Page: [X]) or (Page [X])
+    // VISUAL_REFERENCES: [Book: "Name", Page: X; Book: "Name", Page: Y]
+    const references: { bookIndex: number; pageNumber: number }[] = [];
+    
+    // Extract textual citations
+    textbooks.forEach((book, bIdx) => {
+      // Look for citations specifically for this book name or just page numbers if we can infer
+      const pageMatches = [...answer.matchAll(/Page:?\s*(\d+)/gi)];
+      pageMatches.forEach(match => {
+        const pNum = parseInt(match[1]);
+        if (pNum >= 1 && pNum <= book.pages.length) {
+          // If the book name is nearby in the text (simple heuristic)
+          if (answer.includes(book.name)) {
+             references.push({ bookIndex: bIdx, pageNumber: pNum });
+          }
+        }
+      });
+    });
 
-    const allMentionedPages = [...pageMatches.map(m => parseInt(m[1])), ...visualPages];
-    const uniquePages = Array.from(new Set(allMentionedPages))
-                             .filter(p => p >= 1 && p <= textbook.pages.length)
-                             .sort((a, b) => a - b);
+    // Extract VISUAL_REFERENCES explicitly
+    const visualBlockMatch = answer.match(/VISUAL_REFERENCES: \[(.*?)\]/i);
+    if (visualBlockMatch) {
+      const parts = visualBlockMatch[1].split(';');
+      parts.forEach(part => {
+        textbooks.forEach((book, bIdx) => {
+          if (part.toLowerCase().includes(book.name.toLowerCase().substring(0, 10))) {
+            const pMatch = part.match(/Page:?\s*(\d+)/i);
+            if (pMatch) {
+              references.push({ bookIndex: bIdx, pageNumber: parseInt(pMatch[1]) });
+            }
+          }
+        });
+      });
+    }
 
-    // Clean the answer from internal tagging strings if any
+    // Clean unique refs
+    const uniqueRefs = Array.from(new Set(references.map(r => `${r.bookIndex}-${r.pageNumber}`)))
+                            .map(s => {
+                              const [b, p] = s.split('-').map(Number);
+                              return { bookIndex: b, pageNumber: p };
+                            });
+
     const displayContent = answer.replace(/VISUAL_REFERENCES: \[.*?\]/i, '').trim();
 
     const assistantMessage: Message = {
       id: (Date.now() + 1).toString(),
       role: 'assistant',
       content: displayContent,
-      pages: uniquePages.length > 0 ? uniquePages : undefined,
+      pages: uniqueRefs.length > 0 ? uniqueRefs : undefined,
       timestamp: Date.now()
     };
 
     setMessages(prev => [...prev, assistantMessage]);
     setIsAnswering(false);
     
-    if (uniquePages.length > 0) {
-      jumpToPage(uniquePages[0]);
+    if (uniqueRefs.length > 0) {
+      jumpToRef(uniqueRefs[0].bookIndex, uniqueRefs[0].pageNumber);
     }
   };
 
-  const jumpToPage = (pageNum: number) => {
-    if (pageNum >= 1 && pageNum <= (textbook?.pages.length || 0)) {
-      setCurrentPage(pageNum);
-    }
+  const jumpToRef = (bookIdx: number, pageNum: number) => {
+    setSelectedBookIdx(bookIdx);
+    setCurrentPage(pageNum);
   };
 
-  const currentPageData = textbook?.pages[currentPage - 1];
+  const currentBook = textbooks[selectedBookIdx];
+  const currentPageData = currentBook?.pages[currentPage - 1];
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 text-slate-900 overflow-hidden">
@@ -122,13 +178,13 @@ const App: React.FC = () => {
             <BookOpen size={24} />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight text-slate-800">Verbatim Study Hub</h1>
-            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Multimodal Global Retrieval</p>
+            <h1 className="text-xl font-bold tracking-tight text-slate-800">Verbatim Library Hub</h1>
+            <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Multi-Book Global Retrieval</p>
           </div>
         </div>
 
         <div className="flex items-center gap-4">
-          {textbook && (
+          {textbooks.length > 0 && (
             <div className="flex bg-slate-100 p-1 rounded-lg">
               <button 
                 onClick={() => setViewMode('chat')}
@@ -150,14 +206,15 @@ const App: React.FC = () => {
             disabled={isProcessing}
             className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white rounded-lg font-semibold transition-colors shadow-lg shadow-indigo-200"
           >
-            {isProcessing ? <Loader2 className="animate-spin" size={20} /> : <Upload size={20} />}
-            {textbook ? 'Change Book' : 'Upload Textbook'}
+            {isProcessing ? <Loader2 className="animate-spin" size={20} /> : <Plus size={20} />}
+            Add Books
           </button>
           <input 
             type="file" 
             ref={fileInputRef} 
             onChange={handleFileUpload} 
             accept="application/pdf" 
+            multiple
             className="hidden" 
           />
         </div>
@@ -165,32 +222,21 @@ const App: React.FC = () => {
 
       {/* Main Content */}
       <main className="flex flex-1 overflow-hidden">
-        {!textbook && !isProcessing ? (
+        {textbooks.length === 0 && !isProcessing ? (
           <div className="flex-1 flex flex-col items-center justify-center p-12 text-center max-w-2xl mx-auto">
             <div className="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center mb-6 border-4 border-white shadow-inner">
               <Upload className="text-indigo-600" size={40} />
             </div>
-            <h2 className="text-3xl font-bold mb-4 text-slate-800">Global Multimodal Search Assistant</h2>
+            <h2 className="text-3xl font-bold mb-4 text-slate-800">Your Personal Verbatim Library</h2>
             <p className="text-lg text-slate-600 mb-8 leading-relaxed">
-              Upload your textbook for exhaustive retrieval. We analyze every page across all chapters, extracting exact textual quotes and relevant medical illustrations.
+              Upload multiple textbooks to create a searchable library. Our AI synthesizes data across all books, providing verbatim quotes and visual figures.
             </p>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full text-left">
-              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                <div className="text-indigo-600 mb-3"><ImageIcon size={24} /></div>
-                <h3 className="font-bold mb-1">Visual Retrieval</h3>
-                <p className="text-sm text-slate-500">Automatically identifies and displays relevant figures from any chapter.</p>
-              </div>
-              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                <div className="text-indigo-600 mb-3"><BookOpen size={24} /></div>
-                <h3 className="font-bold mb-1">Chapter Linking</h3>
-                <p className="text-sm text-slate-500">Connects basic definitions from intro chapters to advanced details later.</p>
-              </div>
-              <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                <div className="text-indigo-600 mb-3"><AlertCircle size={24} /></div>
-                <h3 className="font-bold mb-1">Verbatim</h3>
-                <p className="text-sm text-slate-500">Pure extraction with zero paraphrasing for academic integrity.</p>
-              </div>
-            </div>
+            <button 
+               onClick={() => fileInputRef.current?.click()}
+               className="px-8 py-4 bg-indigo-600 text-white rounded-xl font-bold text-lg shadow-xl shadow-indigo-100 hover:scale-105 transition-transform"
+            >
+              Get Started: Upload PDFs
+            </button>
           </div>
         ) : isProcessing ? (
           <div className="flex-1 flex flex-col items-center justify-center">
@@ -198,36 +244,61 @@ const App: React.FC = () => {
               <div className="absolute inset-0 bg-indigo-100 rounded-full blur-2xl opacity-50 animate-pulse"></div>
               <Loader2 className="animate-spin text-indigo-600 relative" size={64} />
             </div>
-            <p className="mt-6 text-xl font-medium text-slate-700">Analyzing Chapters & Figures...</p>
-            <p className="text-slate-400 text-sm mt-2">Indexing document for global cross-referencing</p>
+            <p className="mt-6 text-xl font-medium text-slate-700">Indexing Your Library...</p>
+            <p className="text-slate-400 text-sm mt-2">Processing multiple chapters and figures</p>
           </div>
         ) : (
           <div className="flex flex-1 overflow-hidden">
             {/* Split View: Textbook Sidebar */}
-            {viewMode === 'split' && textbook && (
+            {viewMode === 'split' && (
               <div className="w-1/2 flex flex-col border-r border-slate-200 bg-slate-200/30">
+                {/* Book Selector Header */}
+                <div className="bg-white px-4 py-2 border-b border-slate-200 flex flex-wrap gap-2">
+                  {textbooks.map((book, idx) => (
+                    <div 
+                      key={idx}
+                      onClick={() => { setSelectedBookIdx(idx); setCurrentPage(1); }}
+                      className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border cursor-pointer transition-all text-xs font-semibold ${
+                        selectedBookIdx === idx 
+                          ? 'bg-indigo-50 border-indigo-200 text-indigo-700 shadow-sm' 
+                          : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+                      }`}
+                    >
+                      <FileText size={12} />
+                      <span className="max-w-[120px] truncate">{book.name}</span>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); removeBook(idx); }}
+                        className="p-1 hover:bg-slate-200 rounded"
+                      >
+                        <Trash2 size={10} className="text-slate-400 hover:text-red-500" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
                 <div className="bg-white px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-                  <span className="text-sm font-semibold text-slate-600 truncate max-w-[200px]">{textbook.name}</span>
+                  <span className="text-sm font-bold text-slate-700 truncate">{currentBook?.name}</span>
                   <div className="flex items-center gap-3">
                     <button 
-                      onClick={() => jumpToPage(currentPage - 1)}
+                      onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
                       disabled={currentPage <= 1}
                       className="p-1 hover:bg-slate-100 disabled:opacity-30 rounded transition-colors"
                     >
                       <ChevronLeft size={20} />
                     </button>
                     <span className="text-xs font-bold px-2 py-1 bg-slate-100 rounded text-slate-700">
-                      PAGE {currentPage} / {textbook.pages.length}
+                      PAGE {currentPage} / {currentBook?.pages.length}
                     </span>
                     <button 
-                      onClick={() => jumpToPage(currentPage + 1)}
-                      disabled={currentPage >= textbook.pages.length}
+                      onClick={() => setCurrentPage(prev => Math.min(currentBook?.pages.length || 1, prev + 1))}
+                      disabled={currentPage >= (currentBook?.pages.length || 0)}
                       className="p-1 hover:bg-slate-100 disabled:opacity-30 rounded transition-colors"
                     >
                       <ChevronRight size={20} />
                     </button>
                   </div>
                 </div>
+                
                 <div className="flex-1 overflow-auto p-6 custom-scrollbar flex items-center justify-center">
                   <div className="bg-white shadow-2xl border border-slate-300 relative group max-w-full">
                     {currentPageData ? (
@@ -238,12 +309,9 @@ const App: React.FC = () => {
                       />
                     ) : (
                       <div className="w-full h-96 flex items-center justify-center bg-slate-50 text-slate-400 italic">
-                        Page content unavailable
+                        Select a book to preview
                       </div>
                     )}
-                    <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                       <span className="bg-slate-800/80 text-white text-[10px] px-2 py-1 rounded backdrop-blur uppercase tracking-tighter">Reference Viewer</span>
-                    </div>
                   </div>
                 </div>
               </div>
@@ -265,7 +333,7 @@ const App: React.FC = () => {
                     }`}>
                       {message.role === 'assistant' && (
                         <div className="px-4 py-2 bg-slate-200/50 border-b border-slate-200 flex items-center gap-2 opacity-70 text-[10px] font-bold uppercase tracking-widest">
-                          <BookOpen size={12} /> Global Retrieval
+                          <BookOpen size={12} /> Multi-Book Retrieval
                         </div>
                       )}
                       
@@ -276,31 +344,35 @@ const App: React.FC = () => {
                       </div>
 
                       {/* Visual Reference Gallery */}
-                      {message.role === 'assistant' && message.pages && textbook && (
+                      {message.role === 'assistant' && message.pages && textbooks.length > 0 && (
                         <div className="bg-white p-4 border-t border-slate-200">
                           <div className="flex items-center gap-2 mb-3">
                             <ImageIcon size={14} className="text-indigo-600" />
-                            <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Visual References from Textbook</h4>
+                            <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Cross-Library Visual References</h4>
                           </div>
                           <div className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar">
-                            {message.pages.map(p => {
-                              const pData = textbook.pages[p - 1];
+                            {message.pages.map((ref, idx) => {
+                              const book = textbooks[ref.bookIndex];
+                              const pData = book?.pages[ref.pageNumber - 1];
                               if (!pData) return null;
                               return (
-                                <div key={p} className="flex-shrink-0 group relative">
+                                <div key={idx} className="flex-shrink-0 group relative w-32">
                                   <div 
-                                    className={`w-32 h-44 rounded border overflow-hidden cursor-pointer transition-all ${
-                                      currentPage === p ? 'border-indigo-600 ring-2 ring-indigo-100 shadow-md' : 'border-slate-200 grayscale-[0.5] hover:grayscale-0 hover:border-indigo-300'
+                                    className={`h-44 rounded border overflow-hidden cursor-pointer transition-all ${
+                                      selectedBookIdx === ref.bookIndex && currentPage === ref.pageNumber 
+                                        ? 'border-indigo-600 ring-2 ring-indigo-100 shadow-md' 
+                                        : 'border-slate-200 grayscale-[0.5] hover:grayscale-0 hover:border-indigo-300'
                                     }`}
-                                    onClick={() => jumpToPage(p)}
+                                    onClick={() => jumpToRef(ref.bookIndex, ref.pageNumber)}
                                   >
-                                    <img src={pData.dataUrl} className="w-full h-full object-cover" alt={`Page ${p}`} />
+                                    <img src={pData.dataUrl} className="w-full h-full object-cover" alt="Source Figure" />
                                     <div className="absolute inset-0 bg-indigo-600/10 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                                       <Maximize2 size={16} className="text-white drop-shadow-md" />
                                     </div>
                                   </div>
-                                  <div className="mt-1 text-center">
-                                    <span className="text-[9px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">PAGE {p}</span>
+                                  <div className="mt-1 flex flex-col gap-0.5">
+                                    <span className="text-[8px] font-bold text-slate-400 uppercase truncate">{book.name}</span>
+                                    <span className="text-[9px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded-sm inline-block text-center">PAGE {ref.pageNumber}</span>
                                   </div>
                                 </div>
                               );
@@ -311,7 +383,7 @@ const App: React.FC = () => {
 
                       {message.role === 'user' && (
                         <div className="mt-2 opacity-70 text-[10px] font-bold uppercase tracking-widest flex items-center gap-1">
-                          <MessageSquare size={10} /> User Inquiry
+                          <MessageSquare size={10} /> User Query
                         </div>
                       )}
                     </div>
@@ -322,7 +394,7 @@ const App: React.FC = () => {
                     <div className="bg-slate-100 border border-slate-200 rounded-2xl rounded-tl-none p-5 shadow-sm max-w-[85%]">
                       <div className="flex items-center gap-3">
                         <Loader2 className="animate-spin text-indigo-600" size={18} />
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-widest animate-pulse">Aggregating Global Chapters...</span>
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-widest animate-pulse">Scanning Library...</span>
                       </div>
                     </div>
                   </div>
@@ -337,12 +409,13 @@ const App: React.FC = () => {
                     type="text"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    placeholder="Ask a specific question (text & figures)..."
+                    placeholder={textbooks.length > 0 ? "Query all textbooks verbatim..." : "Upload a book first..."}
+                    disabled={textbooks.length === 0}
                     className="w-full pl-5 pr-12 py-4 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all shadow-inner"
                   />
                   <button
                     type="submit"
-                    disabled={!input.trim() || isAnswering}
+                    disabled={!input.trim() || isAnswering || textbooks.length === 0}
                     className="absolute right-2 top-2 p-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white rounded-lg transition-colors shadow-sm"
                   >
                     {isAnswering ? <Loader2 className="animate-spin" size={24} /> : <Send size={24} />}
@@ -350,10 +423,10 @@ const App: React.FC = () => {
                 </form>
                 <div className="mt-2 flex items-center justify-between px-1">
                   <div className="flex items-center gap-3 text-[9px] text-slate-400 font-bold uppercase tracking-tighter">
-                    <span className="flex items-center gap-1"><AlertCircle size={8} /> Global Multimodal Mode</span>
-                    <span className="flex items-center gap-1"><ImageIcon size={8} /> Visual Figures Included</span>
+                    <span className="flex items-center gap-1"><BookOpen size={8} /> {textbooks.length} Books Loaded</span>
+                    <span className="flex items-center gap-1"><ImageIcon size={8} /> Cross-Book Figures</span>
                   </div>
-                  <span className="text-[9px] text-slate-300 italic">Extracted content is 100% verbatim</span>
+                  <span className="text-[9px] text-slate-300 italic">Synthesized global search active</span>
                 </div>
               </div>
             </div>

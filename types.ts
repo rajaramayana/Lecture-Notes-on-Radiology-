@@ -3,7 +3,7 @@ export interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  pages?: number[];
+  pages?: { bookIndex: number; pageNumber: number }[];
   timestamp: number;
 }
 

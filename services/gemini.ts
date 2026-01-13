@@ -1,58 +1,58 @@
 
 import { GoogleGenAI, GenerateContentResponse, Part } from "@google/genai";
-import { TextbookPage } from "../types";
+import { TextbookData } from "../types";
 
 const SYSTEM_INSTRUCTION = `
-You are an AI assistant embedded in a textbook-based question answering application.
-The user uploads textbook pages containing text and images.
-Your core mission: BE A COMPLETE RETRIEVAL ENGINE. DO NOT BE A CHATBOT.
+You are an AI assistant embedded in a multi-textbook study application.
+The user uploads multiple textbook PDFs containing text and images.
+Your core mission: BE A COMPLETE RETRIEVAL ENGINE ACROSS ALL BOOKS.
 
-Rules for "Global Deep Search & Visual Retrieval":
-1. EXHAUSTIVE SCAN: Analyze EVERY page provided. Concept progression is key. 
-2. STRUCTURED SYNTHESIS: 
-   - Start with "Introductory Overview" (verbatim from early chapters).
-   - Follow with "Detailed Technical Analysis" (verbatim from later chapters).
-   - Include any "Clinical/Practical Correlations" found further in the book.
-3. VISUAL IDENTIFICATION: If a page contains a figure, diagram, or table that illustrates the topic, you MUST mention it.
-4. RESPONSE FORMAT:
-   - Use verbatim extracts only.
-   - For every section of text, cite the page: (Page [X]).
-   - AT THE VERY END OF YOUR RESPONSE, provide a list of key visual pages in this format: 
-     VISUAL_REFERENCES: [Page X, Page Y]
-5. NO EARLY TERMINATION: Scan all 50 pages. Do not stop at the first chapter.
-6. SOURCE TAGGING: Every single fact must be followed by its page number.
-7. REJECTION: Only say "Not available" if the topic is absent from all pages.
+Rules for "Multi-Book Global Deep Search":
+1. CROSS-BOOK SEARCH: Analyze EVERY page provided across ALL uploaded textbooks. 
+2. SYNTHESIS: 
+   - Combine introductory concepts from one book with detailed technical explanations from another if they share the same topic.
+   - Organize logically: Basic concepts -> Technical details -> Practical/Clinical applications.
+3. VISUAL IDENTIFICATION: Identify relevant figures or tables from any of the books.
+4. RESPONSE FORMAT & ATTRIBUTION:
+   - Use verbatim extracts ONLY. Do not paraphrase.
+   - CITE EVERY SOURCE. Format: (Book: [Book Name], Page: [X]).
+   - AT THE END, provide a list of key visual references in this format: 
+     VISUAL_REFERENCES: [Book: "Name", Page: X; Book: "Name", Page: Y]
+5. NO EARLY TERMINATION: Do not stop searching after finding an answer in the first book. Scan everything.
+6. HONESTY: Only say "Not available" if the topic is absent from all provided pages of all books.
 
-Your goal: Provide the complete textual and visual context for the topic as presented across the entire textbook.
+Goal: Provide the most comprehensive answer by pulling the best verbatim information from the entire library of provided textbooks.
 `;
 
 export const askGemini = async (
   question: string,
-  pages: TextbookPage[],
+  textbooks: TextbookData[],
   chatHistory: { role: string; content: string }[]
 ): Promise<string> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
   
-  const pageParts: Part[] = pages.flatMap(p => [
-    {
-      text: `CONTENT OF PAGE ${p.pageNumber}:\n${p.text}`
-    },
-    {
-      inlineData: {
-        mimeType: "image/jpeg",
-        data: p.dataUrl.split(',')[1]
+  const pageParts: Part[] = textbooks.flatMap((book, bookIdx) => 
+    book.pages.flatMap(p => [
+      {
+        text: `BOOK: "${book.name}" (Index: ${bookIdx}), PAGE ${p.pageNumber}:\n${p.text}`
+      },
+      {
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: p.dataUrl.split(',')[1]
+        }
       }
-    }
-  ]);
+    ])
+  );
 
   const prompt = `SEARCH REQUEST: "${question}"
 
 IMPORTANT INSTRUCTION: 
-1. This is a multi-chapter search. Do NOT stop at Chapter 1. 
-2. Scan through all provided pages. 
-3. Synthesis basic definitions with advanced explanations.
-4. Use verbatim extracts only.
-5. Identify any relevant figures or diagrams and list them at the end using the VISUAL_REFERENCES format.`;
+1. This is a multi-book search. You have ${textbooks.length} books available.
+2. Scan through all pages of all books. 
+3. Use verbatim extracts only.
+4. Identify any relevant figures and list them using the VISUAL_REFERENCES format. 
+5. Ensure you specify exactly which book and page each quote comes from.`;
 
   try {
     const response: GenerateContentResponse = await ai.models.generateContent({
@@ -74,7 +74,7 @@ IMPORTANT INSTRUCTION:
       },
     });
 
-    return response.text || "The answer is not available in the provided textbook.";
+    return response.text || "The answer is not available in the provided textbooks.";
   } catch (error) {
     console.error("Gemini API Error:", error);
     return "Error communicating with the AI. Please try again.";
