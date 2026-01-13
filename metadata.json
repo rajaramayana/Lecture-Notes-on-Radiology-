@@ -1,0 +1,7 @@
+{
+  "name": "Extractive Textbook Assistant",
+  "description": "A high-precision AI assistant that provides verbatim answers and relevant figures from uploaded textbooks. Built for academic integrity and strict factual retrieval.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
